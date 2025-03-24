@@ -480,6 +480,17 @@ static VAStatus nvQueryConfigProfiles(
         int *num_profiles			/* out */
     )
 {
+    static VAProfile cached_profile_list[MAX_PROFILES] = { 0 };
+    static int cached_num_profiles = -1;
+
+    if (cached_num_profiles != -1) {
+        *num_profiles = cached_num_profiles;
+        for (int i = 0; i < cached_num_profiles; i++) {
+            profile_list[i] = cached_profile_list[i];
+        }
+        return VA_STATUS_SUCCESS;
+    }
+
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -587,6 +598,11 @@ static VAStatus nvQueryConfigProfiles(
     *num_profiles = profiles;
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+
+    cached_num_profiles = *num_profiles;
+    for (int i = 0; i < cached_num_profiles; i++) {
+        cached_profile_list[i] = profile_list[i];
+    }
 
     return VA_STATUS_SUCCESS;
 }
