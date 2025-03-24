@@ -62,11 +62,10 @@ static pid_t nv_gettid(void)
 }
 
 static pthread_mutex_t concurrency_mutex = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t instances;
-static uint32_t max_instances;
 
 static CudaFunctions *cu;
 static CuvidFunctions *cv;
+static NVDriver *drv = NULL;
 
 extern const NVCodec __start_nvd_codecs[];
 extern const NVCodec __stop_nvd_codecs[];
@@ -119,11 +118,6 @@ static void init() {
         gpu = atoi(nvdGpu);
     }
 
-    char *nvdMaxInstances = getenv("NVD_MAX_INSTANCES");
-    if (nvdMaxInstances != NULL) {
-        max_instances = atoi(nvdMaxInstances);
-    }
-
     char *nvdBackend = getenv("NVD_BACKEND");
     if (nvdBackend != NULL) {
         if (strncmp(nvdBackend, "direct", 6) == 0) {
@@ -166,8 +160,27 @@ static void init() {
     CHECK_CUDA_RESULT(cu->cuInit(0));
 }
 
+static void deleteAllObjects(NVDriver *drv);
+
 __attribute__ ((destructor))
 static void cleanup() {
+    if (drv != NULL && cv != NULL && cu != NULL) {
+        if (cu->cuCtxPushCurrent(drv->cudaContext) != CUDA_SUCCESS) {
+            return;
+        }
+        drv->backend->destroyAllBackingImage(drv);
+        deleteAllObjects(drv);
+        drv->backend->releaseExporter(drv);
+        if (cu->cuCtxPopCurrent(NULL) != CUDA_SUCCESS) {
+            return;
+        }
+        if (cu->cuCtxDestroy(drv->cudaContext) != CUDA_SUCCESS) {
+            return;
+        }
+        free(drv);
+        drv = NULL;
+    }
+
     if (cv != NULL) {
         cuvid_free_functions(&cv);
     }
@@ -2144,29 +2157,6 @@ static VAStatus nvExportSurfaceHandle(
 
 static VAStatus nvTerminate( VADriverContextP ctx )
 {
-    NVDriver *drv = (NVDriver*) ctx->pDriverData;
-    LOG("Terminating %p", ctx);
-
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-
-    drv->backend->destroyAllBackingImage(drv);
-
-    deleteAllObjects(drv);
-
-    drv->backend->releaseExporter(drv);
-
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
-
-    pthread_mutex_lock(&concurrency_mutex);
-    instances--;
-    LOG("Now have %d (%d max) instances", instances, max_instances);
-    pthread_mutex_unlock(&concurrency_mutex);
-
-    CHECK_CUDA_RESULT_RETURN(cu->cuCtxDestroy(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-    drv->cudaContext = NULL;
-
-    free(drv);
-
     return VA_STATUS_SUCCESS;
 }
 
@@ -2256,21 +2246,38 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         }
     }
 
-    pthread_mutex_lock(&concurrency_mutex);
-    LOG("Now have %d (%d max) instances", instances, max_instances);
-    if (max_instances > 0 && instances >= max_instances) {
-        pthread_mutex_unlock(&concurrency_mutex);
-        return VA_STATUS_ERROR_HW_BUSY;
-    }
-    instances++;
-    pthread_mutex_unlock(&concurrency_mutex);
-
     //check to make sure we initialised the CUDA functions correctly
     if (cu == NULL || cv == NULL) {
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    NVDriver *drv = (NVDriver*) calloc(1, sizeof(NVDriver));
+    ctx->max_profiles = MAX_PROFILES;
+    ctx->max_entrypoints = 1;
+    ctx->max_attributes = 1;
+    ctx->max_display_attributes = 1;
+    ctx->max_image_formats = ARRAY_SIZE(formatsInfo) - 1;
+    ctx->max_subpic_formats = 1;
+    *ctx->vtable = vtable;
+
+    if (backend == DIRECT) {
+        ctx->str_vendor = "VA-API NVDEC driver [direct backend]";
+    } else if (backend == EGL) {
+        ctx->str_vendor = "VA-API NVDEC driver [egl backend]";
+    }
+
+    pthread_mutex_lock(&concurrency_mutex);
+
+    if (drv) {
+        ctx->pDriverData = drv;
+        pthread_mutex_unlock(&concurrency_mutex);
+        return VA_STATUS_SUCCESS;
+    }
+
+    drv = (NVDriver*) calloc(1, sizeof(NVDriver));
+    if (!drv) {
+        pthread_mutex_unlock(&concurrency_mutex);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
     ctx->pDriverData = drv;
 
     drv->cu = cu;
@@ -2288,18 +2295,6 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         drv->backend = &DIRECT_BACKEND;
     }
 
-    ctx->max_profiles = MAX_PROFILES;
-    ctx->max_entrypoints = 1;
-    ctx->max_attributes = 1;
-    ctx->max_display_attributes = 1;
-    ctx->max_image_formats = ARRAY_SIZE(formatsInfo) - 1;
-    ctx->max_subpic_formats = 1;
-
-    if (backend == DIRECT) {
-        ctx->str_vendor = "VA-API NVDEC driver [direct backend]";
-    } else if (backend == EGL) {
-        ctx->str_vendor = "VA-API NVDEC driver [egl backend]";
-    }
 
     pthread_mutexattr_t attrib;
     pthread_mutexattr_init(&attrib);
@@ -2311,15 +2306,19 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     if (!drv->backend->initExporter(drv)) {
         LOG("Exporter failed");
         free(drv);
+        drv = NULL;
+        pthread_mutex_unlock(&concurrency_mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
     if (CHECK_CUDA_RESULT(cu->cuCtxCreate(&drv->cudaContext, CU_CTX_SCHED_BLOCKING_SYNC, drv->cudaGpuId))) {
         drv->backend->releaseExporter(drv);
         free(drv);
+        drv = NULL;
+        pthread_mutex_unlock(&concurrency_mutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    *ctx->vtable = vtable;
+    pthread_mutex_unlock(&concurrency_mutex);
     return VA_STATUS_SUCCESS;
 }
