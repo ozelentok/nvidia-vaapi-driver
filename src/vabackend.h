@@ -22,6 +22,9 @@
 #define SURFACE_QUEUE_SIZE 16
 #define MAX_IMAGE_COUNT 64
 #define MAX_PROFILES 32
+// Cache index is codec (5 bits), chroma (2 bits) and bit depth (2 bits)
+// 2**(5+2+2) = 512 options
+#define MAX_CACHED_ATTRIBUTES (512)
 
 typedef struct {
     void        *buf;
@@ -167,6 +170,14 @@ typedef struct {
     void (*destroyAllBackingImage)(struct _NVDriver *drv);
 } NVBackend;
 
+typedef struct {
+    unsigned int max_width;
+    unsigned int max_height;
+    unsigned short min_width;
+    unsigned short min_height;
+    uint8_t is_cached;
+} CachedSizeAttributes;
+
 typedef struct _NVDriver
 {
     CudaFunctions           *cu;
@@ -221,6 +232,7 @@ typedef struct _NVDriver
     uint64_t                maxDetachedBackingImageBytes;
     uint32_t                maxDetachedBackingImages;
     uint64_t                detachedBackingImageSerial;
+    CachedSizeAttributes    size_attributes[MAX_CACHED_ATTRIBUTES];
 } NVDriver;
 
 struct _NVCodec;
