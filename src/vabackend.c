@@ -1912,9 +1912,28 @@ static VAStatus nvQuerySurfaceAttributes(
             .nBitDepthMinus8 = cfg->bitDepth - 8
         };
 
-        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
-        CHECK_CUDA_RESULT_RETURN(cv->cuvidGetDecoderCaps(&videoDecodeCaps), VA_STATUS_ERROR_OPERATION_FAILED);
-        CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+        // Cache index is codec (5 bits), chroma (2 bits) and bit depth (2 bits)
+        // 2**(5+2+2) = 512 options
+        uint16_t cache_index = (cfg->cudaCodec << 4) | (cfg->chromaFormat << 2) | (cfg->bitDepth / 2);
+        CachedSizeAttributes *cached_attributes = drv->size_attributes + cache_index;
+        if (cache_index < MAX_CACHED_ATTRIBUTES && cached_attributes->is_cached) {
+            videoDecodeCaps.nMaxHeight = cached_attributes->max_height;
+            videoDecodeCaps.nMaxWidth = cached_attributes->max_width;
+            videoDecodeCaps.nMinHeight = cached_attributes->min_height;
+            videoDecodeCaps.nMinWidth = cached_attributes->min_width;
+        } else {
+            CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+            CHECK_CUDA_RESULT_RETURN(cv->cuvidGetDecoderCaps(&videoDecodeCaps), VA_STATUS_ERROR_OPERATION_FAILED);
+            CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
+        }
+
+        if (cache_index < MAX_CACHED_ATTRIBUTES && !cached_attributes->is_cached) {
+            cached_attributes->max_height = videoDecodeCaps.nMaxHeight;
+            cached_attributes->max_width = videoDecodeCaps.nMaxWidth;
+            cached_attributes->min_height = videoDecodeCaps.nMinHeight;
+            cached_attributes->min_width = videoDecodeCaps.nMinWidth;
+            cached_attributes->is_cached = 1;
+        }
 
         attrib_list[0].type = VASurfaceAttribMinWidth;
         attrib_list[0].flags = 0;
