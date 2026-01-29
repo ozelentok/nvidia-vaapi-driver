@@ -18,6 +18,7 @@
 #include <va/va_backend.h>
 #include <va/va_drmcommon.h>
 #include <va/va_vpp.h>
+#include <va/va_version.h>
 
 #include <drm_fourcc.h>
 
@@ -4683,3 +4684,9 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     *ctx->vtable = vtable;
     return VA_STATUS_SUCCESS;
 }
+
+#define VA_STR_CONCAT2(a, b) a##b
+#define VA_STR_CONCAT(a, b)  VA_STR_CONCAT2(a, b)
+
+__attribute__((alias("__vaDriverInit_1_0"), visibility("default")))
+VAStatus VA_STR_CONCAT(__vaDriverInit_1_, VA_MINOR_VERSION)(VADriverContextP ctx);
