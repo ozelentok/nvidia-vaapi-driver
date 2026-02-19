@@ -330,6 +330,9 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
     int ret = pthread_timedjoin_np(nvCtx->resolveThread, NULL, &timeout);
     LOG("Finished waiting for resolve thread with %d", ret);
 
+    free(nvCtx->codecData);
+    nvCtx->codecData = NULL;
+
     freeBuffer(&nvCtx->sliceOffsets);
     freeBuffer(&nvCtx->bitstreamBuffer);
 
@@ -1342,6 +1345,9 @@ static VAStatus nvBeginPicture(
     nvCtx->renderTarget = surface;
     nvCtx->renderTarget->progressiveFrame = true; //assume we're producing progressive frame unless the codec says otherwise
     nvCtx->pPicParams.CurrPicIdx = nvCtx->renderTarget->pictureIdx;
+    if (nvCtx->codec != NULL && nvCtx->codec->beginPicture != NULL) {
+        nvCtx->codec->beginPicture(nvCtx);
+    }
 
     return VA_STATUS_SUCCESS;
 }

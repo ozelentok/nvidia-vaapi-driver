@@ -167,6 +167,7 @@ typedef struct _NVContext
     uint32_t            height;
     CUvideodecoder      decoder;
     NVSurface           *renderTarget;
+    void                *codecData;
     void                *lastSliceParams;
     unsigned int        lastSliceParamsCount;
     AppendableBuffer    bitstreamBuffer;
@@ -198,6 +199,7 @@ typedef struct
 
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);
 typedef cudaVideoCodec (*ComputeCudaCodec)(VAProfile);
+typedef void (*CodecBeginPictureFunc)(NVContext*);
 
 //padding/alignment is very important to this structure as it's placed in it's own section
 //in the executable.
@@ -206,6 +208,7 @@ struct _NVCodec {
     HandlerFunc         handlers[VABufferTypeMax];
     int                 supportedProfileCount;
     const VAProfile     *supportedProfiles;
+    CodecBeginPictureFunc beginPicture;
 };
 
 typedef struct _NVCodec NVCodec;
