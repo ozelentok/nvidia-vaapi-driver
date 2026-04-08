@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ */
+
 #define _GNU_SOURCE 1
 
 #include <sys/ioctl.h>
@@ -11,6 +16,7 @@
 
 #include "nv-driver.h"
 #include <nvidia.h>
+#include <ctrl/ctrl2080/ctrl2080fb.h>
 
 #include "../vabackend.h"
 
@@ -28,8 +34,8 @@
 
 static const NvHandle NULL_OBJECT;
 
-static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
-                            NvHandle* hObjectNew,const NvV32 hClass, const uint32_t paramSize, void* params) {
+static int nv_alloc_object_with_status(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
+                                       NvHandle* hObjectNew, const NvV32 hClass, const uint32_t paramSize, void* params) {
     NVOS64_PARAMETERS alloc = {
         .hRoot = hRoot,
         .hObjectParent = hObjectParent,
@@ -67,13 +73,25 @@ static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, con
         status = (int) alloc.status;
     }
 
-    if (ret != 0 || status != NV_OK) {
-        LOG("nv_alloc_object failed: %d %X %d", ret, status, errno)
-        return false;
+    if (ret != 0) {
+        LOG("nv_alloc_object ioctl failed: %d %X %d", ret, status, errno)
+        return status != NV_OK ? status : NV_ERR_OPERATING_SYSTEM;
     }
 
-    *hObjectNew = alloc.hObjectNew;
+    if (status == NV_OK) {
+        *hObjectNew = alloc.hObjectNew;
+    }
 
+    return status;
+}
+
+static bool nv_alloc_object(const int fd, const uint32_t driverMajorVersion, const NvHandle hRoot, const NvHandle hObjectParent,
+                            NvHandle* hObjectNew, const NvV32 hClass, const uint32_t paramSize, void* params) {
+    int status = nv_alloc_object_with_status(fd, driverMajorVersion, hRoot, hObjectParent, hObjectNew, hClass, paramSize, params);
+    if (status != NV_OK) {
+        LOG("nv_alloc_object failed: %X", status)
+        return false;
+    }
     return true;
 }
 
@@ -301,6 +319,46 @@ bool get_device_uuid(const NVDriverContext *context, uint8_t uuid[16]) {
     return true;
 }
 
+// Query memory architecture via RM control.
+// Returns true for unified memory (zero-FB) systems like Grace-Blackwell/Grace-Hopper.
+static bool query_ram_location(NVDriverContext *context) {
+    NV2080_CTRL_FB_GET_INFO_V2_PARAMS params = {
+        .fbInfoListSize = 3,
+        .fbInfoList = {
+            { .index = NV2080_CTRL_FB_INFO_INDEX_RAM_LOCATION, .data = 0 },
+            { .index = NV2080_CTRL_FB_INFO_INDEX_IS_ZERO_FB, .data = 0 },
+            { .index = NV2080_CTRL_FB_INFO_INDEX_COHERENCE_INFO, .data = 0 }
+        }
+    };
+
+    if (!nv_rm_control(context->nvctlFd, context->clientObject, context->subdeviceObject,
+                      NV2080_CTRL_CMD_FB_GET_INFO_V2, 0, sizeof(params), &params)) {
+        LOG("NV2080_CTRL_CMD_FB_GET_INFO_V2 failed, assuming discrete GPU");
+        return false;
+    }
+
+    NvU32 ramLoc = params.fbInfoList[0].data;
+    NvU32 isZeroFb = params.fbInfoList[1].data;
+    NvU32 coherenceInfo = params.fbInfoList[2].data;
+
+    // Primary detection: IS_ZERO_FB indicates no dedicated VRAM (Grace-Blackwell/Grace-Hopper).
+    // RAM_LOCATION is currently hardcoded to GPU_DEDICATED in RM and cannot be relied upon.
+    bool unified = (isZeroFb == 1);
+
+    if (unified) {
+        LOG("Detected unified memory system (IS_ZERO_FB=1, COHERENCE=%s)",
+            coherenceInfo == NV2080_CTRL_FB_INFO_INDEX_COHERENCE_INFO_FULLY_COHERENT
+                ? "FULLY_COHERENT" : "NON_FULLY_COHERENT");
+    } else if (ramLoc == NV2080_CTRL_FB_INFO_RAM_LOCATION_SYS_SHARED) {
+        // Fallback: if RM ever fixes RAM_LOCATION, honour it
+        LOG("Detected unified memory system (RAM_LOCATION=SYS_SHARED)");
+        unified = true;
+    } else {
+        LOG("Detected discrete GPU (IS_ZERO_FB=0, RAM_LOCATION=0x%X)", ramLoc);
+    }
+    return unified;
+}
+
 bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     LOG("Initing nvdriver...")
     int nv0Fd = -1;
@@ -383,6 +441,10 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
     context->drmFd = drmFd;
     context->nvctlFd = nvctlFd;
     context->nv0Fd = nv0Fd;
+
+    // Detect if this is a unified memory system (Grace-Blackwell/Grace-Hopper)
+    // Must be after context FD fields are set since query_ram_location uses context->nvctlFd
+    context->useSystemMemory = query_ram_location(context);
     //context->hasHugePage = vaParams.hugePageSize != 0;
 
     return true;
@@ -421,28 +483,45 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
     //allocate the buffer
     NvHandle bufferObject = {0};
 
+    // Choose memory class based on system type
+    NvU32 memoryClass;
     NV_MEMORY_ALLOCATION_PARAMS memParams = {
         .owner = context->clientObject,
         .type = NVOS32_TYPE_IMAGE,
-        .flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
-                 NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED |
-                 NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM,
-
-        .attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
-                DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
-                DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
-                DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS),
         .format = 0,
         .width = 0,
         .height = 0,
         .size = size,
-        .alignment = 0, //see flags above
+        .alignment = 0,
         .attr2 = DRF_DEF(OS32, _ATTR2, _ZBC, _PREFER_NO_ZBC) |
                  DRF_DEF(OS32, _ATTR2, _GPU_CACHEABLE, _YES)
     };
-    bool ret = nv_alloc_object(context->nvctlFd, context->driverMajorVersion, context->clientObject, context->deviceObject, &bufferObject, NV01_MEMORY_LOCAL_USER, sizeof(memParams), &memParams);
+
+    if (context->useSystemMemory) {
+        // Unified memory system (Grace-Blackwell/Grace-Hopper)
+        memoryClass = NV01_MEMORY_SYSTEM;
+        memParams.flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
+                          NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED;
+        memParams.attr = DRF_DEF(OS32, _ATTR, _LOCATION, _PCI) |
+                         DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
+                         DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
+                         DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
+                         DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS);
+    } else {
+        // Discrete GPU with local video memory
+        memoryClass = NV01_MEMORY_LOCAL_USER;
+        memParams.flags = NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT |
+                          NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED |
+                          NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM;
+        memParams.attr = DRF_DEF(OS32, _ATTR, _PAGE_SIZE, _BIG) |
+                         DRF_DEF(OS32, _ATTR, _DEPTH, _UNKNOWN) |
+                         DRF_DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR) |
+                         DRF_DEF(OS32, _ATTR, _PHYSICALITY, _CONTIGUOUS);
+    }
+    
+    bool ret = nv_alloc_object(context->nvctlFd, context->driverMajorVersion, context->clientObject, context->deviceObject, &bufferObject, memoryClass, sizeof(memParams), &memParams);
     if (!ret) {
-        LOG("nv_alloc_object NV01_MEMORY_LOCAL_USER failed")
+        LOG("nv_alloc_object failed for memory class 0x%X", memoryClass)
         return false;
     }
 
@@ -538,7 +617,7 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
          .surfaceParams = {
              .layout = NvKmsSurfaceMemoryLayoutBlockLinear,
              .blockLinear = {
-                 .genericMemory = 0,
+                 .genericMemory = context->useSystemMemory ? 1 : 0,
                  .pitchInBlocks = pitchInBlocks,
                  .log2GobsPerBlock.x = log2GobsPerBlockX,
                  .log2GobsPerBlock.y = log2GobsPerBlockY,
