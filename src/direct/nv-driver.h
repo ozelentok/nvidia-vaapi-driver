@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ */
+
 #ifndef NV_DRIVER_H
 #define NV_DRIVER_H
 
@@ -23,6 +28,7 @@ typedef struct {
     uint32_t generic_page_kind;
     uint32_t page_kind_generation;
     uint32_t sector_layout;
+    bool useSystemMemory;  // True for unified memory systems (Grace-Blackwell/Grace-Hopper)
 } NVDriverContext;
 
 typedef struct {
